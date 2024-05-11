@@ -10,3 +10,6 @@ nntp is a fork of the (now deprecated) nntplib module from the Python standard l
 ## Requirements
 * Python 3.9+
 * ruff
+
+## Links
+* [PyPi](https://pypi.org/project/nntp/)
