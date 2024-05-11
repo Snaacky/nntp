@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "nntp"
+version = "0.1.0"
+description = ""
+authors = ["Snaacky <snaacky@pm.me>", "Ravencentric <ravencentric@proton.me>"]
+readme = "README.md"
+
+packages = [{include = "nntp", from = "src"}]
+keywords = ["nntp", "usenet", "nntplib", "RFC 977", "RFC 3977", "RFC 4642"]
+[tool.poetry.dependencies]
+python = ">=3.9"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.4.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
