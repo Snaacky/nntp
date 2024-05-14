@@ -1683,7 +1683,7 @@ class MockSocketTests(unittest.TestCase):
 
         socket_closed = False
         files = []
-        with patch("nntp.socket", mock_socket_module), self.assertRaisesRegex(
+        with patch("nntp.nntp.socket", mock_socket_module), self.assertRaisesRegex(
             expected_error_type, expected_error_msg
         ):
             self.nntp_class("dummy", user=login, password=password)
