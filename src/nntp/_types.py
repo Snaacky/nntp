@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing_extensions import IO, NamedTuple, TypeAlias, Union
 
 File: TypeAlias = Union[IO[bytes], bytes, str, None]

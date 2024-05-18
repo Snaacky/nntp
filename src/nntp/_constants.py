@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # maximal line length when calling readline(). This is to prevent
 # reading arbitrary length lines. RFC 3977 limits NNTP line length to
 # 512 characters, including CRLF. We have selected 2048 just to be on

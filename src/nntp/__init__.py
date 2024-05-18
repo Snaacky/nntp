@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from nntp._core import NNTP, NNTP_SSL
 from nntp._exceptions import (
     NNTPDataError,
