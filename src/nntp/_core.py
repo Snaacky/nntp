@@ -61,16 +61,42 @@ are strings, not numbers, since they are rarely used for calculations.
 # TODO:
 # - return structured data (GroupInfo etc.) everywhere
 # - support HDR
+from __future__ import annotations
 
-import collections
 import datetime
 import re
 import socket
-import ssl
 import sys
-from email.header import decode_header as _email_decode_header
-from socket import _GLOBAL_DEFAULT_TIMEOUT
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
+from typing_extensions import Self
+
+from nntp._constants import _CRLF, _DEFAULT_OVERVIEW_FMT, _LONGRESP, _MAXLINE, NNTP_PORT, NNTP_SSL_PORT
+
+# from socket import _GLOBAL_DEFAULT_TIMEOUT
+from nntp._exceptions import (
+    NNTPDataError,
+    NNTPError,
+    NNTPPermanentError,
+    NNTPProtocolError,
+    NNTPReplyError,
+    NNTPTemporaryError,
+)
+from nntp._helpers import (
+    _encrypt_on,
+    _parse_datetime,
+    _parse_overview,
+    _parse_overview_fmt,
+    _unparse_datetime,
+    decode_header,
+)
+from nntp._types import ArticleInfo, File, GroupInfo
+
+if TYPE_CHECKING:
+    from ssl import SSLContext, SSLSocket
+
+    from _typeshed import Unused
 
 __all__ = [
     "NNTP",
@@ -82,223 +108,6 @@ __all__ = [
     "NNTPDataError",
     "decode_header",
 ]
-
-
-# maximal line length when calling readline(). This is to prevent
-# reading arbitrary length lines. RFC 3977 limits NNTP line length to
-# 512 characters, including CRLF. We have selected 2048 just to be on
-# the safe side.
-_MAXLINE = 2048
-
-
-# Exceptions raised when an error or invalid response is received
-class NNTPError(Exception):
-    """Base class for all nntp exceptions"""
-
-    def __init__(self, *args):
-        Exception.__init__(self, *args)
-        try:
-            self.response = args[0]
-        except IndexError:
-            self.response = "No response given"
-
-
-class NNTPReplyError(NNTPError):
-    """Unexpected [123]xx reply"""
-
-
-class NNTPTemporaryError(NNTPError):
-    """4xx errors"""
-
-
-class NNTPPermanentError(NNTPError):
-    """5xx errors"""
-
-
-class NNTPProtocolError(NNTPError):
-    """Response does not begin with [1-5]"""
-
-
-class NNTPDataError(NNTPError):
-    """Error in response data"""
-
-
-# Standard port used by NNTP servers
-NNTP_PORT = 119
-NNTP_SSL_PORT = 563
-
-# Response numbers that are followed by additional text (e.g. article)
-_LONGRESP = {
-    "100",  # HELP
-    "101",  # CAPABILITIES
-    "211",  # LISTGROUP   (also not multi-line with GROUP)
-    "215",  # LIST
-    "220",  # ARTICLE
-    "221",  # HEAD, XHDR
-    "222",  # BODY
-    "224",  # OVER, XOVER
-    "225",  # HDR
-    "230",  # NEWNEWS
-    "231",  # NEWGROUPS
-    "282",  # XGTITLE
-}
-
-# Default decoded value for LIST OVERVIEW.FMT if not supported
-_DEFAULT_OVERVIEW_FMT = [
-    "subject",
-    "from",
-    "date",
-    "message-id",
-    "references",
-    ":bytes",
-    ":lines",
-]
-
-# Alternative names allowed in LIST OVERVIEW.FMT response
-_OVERVIEW_FMT_ALTERNATIVES = {
-    "bytes": ":bytes",
-    "lines": ":lines",
-}
-
-# Line terminators (we always output CRLF, but accept any of CRLF, CR, LF)
-_CRLF = b"\r\n"
-
-GroupInfo = collections.namedtuple("GroupInfo", ["group", "last", "first", "flag"])
-
-ArticleInfo = collections.namedtuple("ArticleInfo", ["number", "message_id", "lines"])
-
-
-# Helper function(s)
-def decode_header(header_str):
-    """Takes a unicode string representing a munged header value
-    and decodes it as a (possibly non-ASCII) readable value."""
-    parts = []
-    for v, enc in _email_decode_header(header_str):
-        if isinstance(v, bytes):
-            parts.append(v.decode(enc or "ascii"))
-        else:
-            parts.append(v)
-    return "".join(parts)
-
-
-def _parse_overview_fmt(lines):
-    """Parse a list of string representing the response to LIST OVERVIEW.FMT
-    and return a list of header/metadata names.
-    Raises NNTPDataError if the response is not compliant
-    (cf. RFC 3977, section 8.4)."""
-    fmt = []
-    for line in lines:
-        if line[0] == ":":
-            # Metadata name (e.g. ":bytes")
-            name, _, suffix = line[1:].partition(":")
-            name = ":" + name
-        else:
-            # Header name (e.g. "Subject:" or "Xref:full")
-            name, _, suffix = line.partition(":")
-        name = name.lower()
-        name = _OVERVIEW_FMT_ALTERNATIVES.get(name, name)
-        # Should we do something with the suffix?
-        fmt.append(name)
-    defaults = _DEFAULT_OVERVIEW_FMT
-    if len(fmt) < len(defaults):
-        raise NNTPDataError("LIST OVERVIEW.FMT response too short")
-    if fmt[: len(defaults)] != defaults:
-        raise NNTPDataError("LIST OVERVIEW.FMT redefines default fields")
-    return fmt
-
-
-def _parse_overview(lines, fmt, data_process_func=None):
-    """Parse the response to an OVER or XOVER command according to the
-    overview format `fmt`."""
-    n_defaults = len(_DEFAULT_OVERVIEW_FMT)
-    overview = []
-    for line in lines:
-        fields = {}
-        article_number, *tokens = line.split("\t")
-        article_number = int(article_number)
-        for i, token in enumerate(tokens):
-            if i >= len(fmt):
-                # XXX should we raise an error? Some servers might not
-                # support LIST OVERVIEW.FMT and still return additional
-                # headers.
-                continue
-            field_name = fmt[i]
-            is_metadata = field_name.startswith(":")
-            if i >= n_defaults and not is_metadata:
-                # Non-default header names are included in full in the response
-                # (unless the field is totally empty)
-                h = field_name + ": "
-                if token and token[: len(h)].lower() != h:
-                    raise NNTPDataError(
-                        "OVER/XOVER response doesn't include "
-                        "names of additional headers"
-                    )
-                token = token[len(h) :] if token else None
-            fields[fmt[i]] = token
-        overview.append((article_number, fields))
-    return overview
-
-
-def _parse_datetime(date_str, time_str=None):
-    """Parse a pair of (date, time) strings, and return a datetime object.
-    If only the date is given, it is assumed to be date and time
-    concatenated together (e.g. response to the DATE command).
-    """
-    if time_str is None:
-        time_str = date_str[-6:]
-        date_str = date_str[:-6]
-    hours = int(time_str[:2])
-    minutes = int(time_str[2:4])
-    seconds = int(time_str[4:])
-    year = int(date_str[:-4])
-    month = int(date_str[-4:-2])
-    day = int(date_str[-2:])
-    # RFC 3977 doesn't say how to interpret 2-char years.  Assume that
-    # there are no dates before 1970 on Usenet.
-    if year < 70:
-        year += 2000
-    elif year < 100:
-        year += 1900
-    return datetime.datetime(year, month, day, hours, minutes, seconds)
-
-
-def _unparse_datetime(dt, legacy=False):
-    """Format a date or datetime object as a pair of (date, time) strings
-    in the format required by the NEWNEWS and NEWGROUPS commands.  If a
-    date object is passed, the time is assumed to be midnight (00h00).
-
-    The returned representation depends on the legacy flag:
-    * if legacy is False (the default):
-      date has the YYYYMMDD format and time the HHMMSS format
-    * if legacy is True:
-      date has the YYMMDD format and time the HHMMSS format.
-    RFC 3977 compliant servers should understand both formats; therefore,
-    legacy is only needed when talking to old servers.
-    """
-    if not isinstance(dt, datetime.datetime):
-        time_str = "000000"
-    else:
-        time_str = "{0.hour:02d}{0.minute:02d}{0.second:02d}".format(dt)
-    y = dt.year
-    if legacy:
-        y = y % 100
-        date_str = "{0:02d}{1.month:02d}{1.day:02d}".format(y, dt)
-    else:
-        date_str = "{0:04d}{1.month:02d}{1.day:02d}".format(y, dt)
-    return date_str, time_str
-
-
-def _encrypt_on(sock, context, hostname):
-    """Wrap a socket in SSL/TLS. Arguments:
-    - sock: Socket to wrap
-    - context: SSL context to use for the encrypted connection
-    Returns:
-    - sock: New, encrypted socket.
-    """
-    # Generate a default SSL context if none was passed.
-    if context is None:
-        context = ssl._create_stdlib_context()
-    return context.wrap_socket(sock, server_hostname=hostname)
 
 
 # The classes themselves
@@ -315,18 +124,18 @@ class NNTP:
     # and easy round-tripping. This could be useful for some applications
     # (e.g. NNTP gateways).
 
-    encoding = "utf-8"
-    errors = "surrogateescape"
+    encoding: str = "utf-8"
+    errors: str = "surrogateescape"
 
     def __init__(
         self,
-        host,
-        port=NNTP_PORT,
-        user=None,
-        password=None,
-        readermode=None,
-        usenetrc=False,
-        timeout=_GLOBAL_DEFAULT_TIMEOUT,
+        host: str,
+        port: int = NNTP_PORT,
+        user: str | None = None,
+        password: str | None = None,
+        readermode: bool | None = None,
+        usenetrc: bool = False,
+        timeout: float | None = None,
     ):
         """Initialize an instance.  Arguments:
         - host: hostname to connect to
@@ -360,7 +169,7 @@ class NNTP:
             self.sock.close()
             raise
 
-    def _base_init(self, readermode):
+    def _base_init(self, readermode: bool | None):
         """Partial initialization for the NNTP protocol.
         This instance method is extracted for supporting the test code.
         """
@@ -394,11 +203,11 @@ class NNTP:
         # Log in and encryption setup order is left to subclasses.
         self.authenticated = False
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args):
-        is_connected = lambda: hasattr(self, "file")
+    def __exit__(self, *args: Unused) -> None:
+        is_connected = lambda: hasattr(self, "file")  # noqa: E731
         if is_connected():
             try:
                 self.quit()
@@ -408,13 +217,13 @@ class NNTP:
                 if is_connected():
                     self._close()
 
-    def _create_socket(self, timeout):
+    def _create_socket(self, timeout: float | None):
         if timeout is not None and not timeout:
             raise ValueError("Non-blocking socket (timeout=0) is not supported")
         sys.audit("nntp.connect", self, self.host, self.port)
         return socket.create_connection((self.host, self.port), timeout)
 
-    def getwelcome(self):
+    def getwelcome(self) -> str:
         """Get the welcome message from the server
         (this is read and squirreled away by __init__()).
         If the response code is 200, posting is allowed;
@@ -424,7 +233,7 @@ class NNTP:
             print("*welcome*", repr(self.welcome))
         return self.welcome
 
-    def getcapabilities(self):
+    def getcapabilities(self) -> dict[str, list[str]]:
         """Get the server capabilities, as read by __init__().
         If the CAPABILITIES command is not supported, an empty dict is
         returned."""
@@ -446,7 +255,7 @@ class NNTP:
                     self.nntp_implementation = " ".join(caps["IMPLEMENTATION"])
         return self._caps
 
-    def set_debuglevel(self, level):
+    def set_debuglevel(self, level: int) -> None:
         """Set the debugging level.  Argument 'level' means:
         0: no debugging output (default)
         1: print commands and responses but not body text etc.
@@ -456,7 +265,7 @@ class NNTP:
 
     debug = set_debuglevel
 
-    def _putline(self, line):
+    def _putline(self, line: bytes) -> None:
         """Internal: send one line to the server, appending CRLF.
         The `line` must be a bytes-like object."""
         sys.audit("nntp.putline", self, line)
@@ -466,7 +275,7 @@ class NNTP:
         self.file.write(line)
         self.file.flush()
 
-    def _putcmd(self, line):
+    def _putcmd(self, line: str) -> None:
         """Internal: send one command to the server (through _putline()).
         The `line` must be a unicode string."""
         if self.debugging:
@@ -474,7 +283,7 @@ class NNTP:
         line = line.encode(self.encoding, self.errors)
         self._putline(line)
 
-    def _getline(self, strip_crlf=True):
+    def _getline(self, strip_crlf: bool = True) -> bytes:
         """Internal: return one line from the server, stripping _CRLF.
         Raise EOFError if the connection is closed.
         Returns a bytes object."""
@@ -492,7 +301,7 @@ class NNTP:
                 line = line[:-1]
         return line
 
-    def _getresp(self):
+    def _getresp(self) -> str:
         """Internal: get a response from the server.
         Raise various errors if the response indicates an error.
         Returns a unicode string."""
@@ -509,7 +318,7 @@ class NNTP:
             raise NNTPProtocolError(resp)
         return resp
 
-    def _getlongresp(self, file=None):
+    def _getlongresp(self, file: File = None) -> tuple[str, list[bytes]]:
         """Internal: get a response plus following text from the server.
         Raise various errors if the response indicates an error.
 
@@ -555,19 +364,19 @@ class NNTP:
 
         return resp, lines
 
-    def _shortcmd(self, line):
+    def _shortcmd(self, line: str) -> str:
         """Internal: send a command and get the response.
         Same return value as _getresp()."""
         self._putcmd(line)
         return self._getresp()
 
-    def _longcmd(self, line, file=None):
+    def _longcmd(self, line: str, file: File = None) -> tuple[str, list[bytes]]:
         """Internal: send a command and get the response plus following text.
         Same return value as _getlongresp()."""
         self._putcmd(line)
         return self._getlongresp(file)
 
-    def _longcmdstring(self, line, file=None):
+    def _longcmdstring(self, line: str, file: File = None) -> tuple[str, list[str]]:
         """Internal: send a command and get the response plus following text.
         Same as _longcmd() and _getlongresp(), except that the returned `lines`
         are unicode strings rather than bytes objects.
@@ -576,7 +385,7 @@ class NNTP:
         resp, list = self._getlongresp(file)
         return resp, [line.decode(self.encoding, self.errors) for line in list]
 
-    def _getoverviewfmt(self):
+    def _getoverviewfmt(self) -> list[str]:
         """Internal: get the overview format. Queries the server if not
         already done, else returns the cached value."""
         try:
@@ -593,11 +402,11 @@ class NNTP:
         self._cachedoverviewfmt = fmt
         return fmt
 
-    def _grouplist(self, lines):
+    def _grouplist(self, lines: list[str]) -> list[GroupInfo]:
         # Parse lines into "group last first flag"
         return [GroupInfo(*line.split()) for line in lines]
 
-    def capabilities(self):
+    def capabilities(self) -> tuple[str, dict[str, list[str]]]:
         """Process a CAPABILITIES command.  Not supported by all servers.
         Return:
         - resp: server response if successful
@@ -611,7 +420,7 @@ class NNTP:
             caps[name] = tokens
         return resp, caps
 
-    def newgroups(self, date, *, file=None):
+    def newgroups(self, date: datetime.date | datetime.datetime, *, file: File = None) -> tuple[str, list[str]]:
         """Process a NEWGROUPS command.  Arguments:
         - date: a date or datetime object
         Return:
@@ -620,15 +429,16 @@ class NNTP:
         """
         if not isinstance(date, (datetime.date, datetime.date)):
             raise TypeError(
-                "the date parameter must be a date or datetime object, "
-                "not '{:40}'".format(date.__class__.__name__)
+                "the date parameter must be a date or datetime object, " "not '{:40}'".format(date.__class__.__name__)
             )
         date_str, time_str = _unparse_datetime(date, self.nntp_version < 2)
         cmd = "NEWGROUPS {0} {1}".format(date_str, time_str)
         resp, lines = self._longcmdstring(cmd, file)
         return resp, self._grouplist(lines)
 
-    def newnews(self, group, date, *, file=None):
+    def newnews(
+        self, group: str, date: datetime.date | datetime.datetime, *, file: File = None
+    ) -> tuple[str, list[str]]:
         """Process a NEWNEWS command.  Arguments:
         - group: group name or '*'
         - date: a date or datetime object
@@ -638,14 +448,13 @@ class NNTP:
         """
         if not isinstance(date, (datetime.date, datetime.date)):
             raise TypeError(
-                "the date parameter must be a date or datetime object, "
-                "not '{:40}'".format(date.__class__.__name__)
+                "the date parameter must be a date or datetime object, " "not '{:40}'".format(date.__class__.__name__)
             )
         date_str, time_str = _unparse_datetime(date, self.nntp_version < 2)
         cmd = "NEWNEWS {0} {1} {2}".format(group, date_str, time_str)
         return self._longcmdstring(cmd, file)
 
-    def list(self, group_pattern=None, *, file=None):
+    def list(self, group_pattern: str | None = None, *, file: File = None) -> tuple[str, list[str]]:
         """Process a LIST or LIST ACTIVE command. Arguments:
         - group_pattern: a pattern indicating which groups to query
         - file: Filename string or file object to store the result in
@@ -660,7 +469,7 @@ class NNTP:
         resp, lines = self._longcmdstring(command, file)
         return resp, self._grouplist(lines)
 
-    def _getdescriptions(self, group_pattern, return_all):
+    def _getdescriptions(self, group_pattern: str, return_all: bool) -> tuple[str, dict[str, Any]] | str:
         line_pat = re.compile("^(?P<group>[^ \t]+)[ \t]+(.*)$")
         # Try the more std (acc. to RFC2980) LIST NEWSGROUPS first
         resp, lines = self._longcmdstring("LIST NEWSGROUPS " + group_pattern)
@@ -683,7 +492,7 @@ class NNTP:
             # Nothing found
             return ""
 
-    def description(self, group):
+    def description(self, group: str) -> str:
         """Get a description for a single group.  If more than one
         group matches ('group' is a pattern), return the first.  If no
         group matches, return an empty string.
@@ -696,11 +505,11 @@ class NNTP:
         it check whether the group actually exists."""
         return self._getdescriptions(group, False)
 
-    def descriptions(self, group_pattern):
+    def descriptions(self, group_pattern: str) -> tuple[str, dict[str, str]]:
         """Get descriptions for a range of groups."""
         return self._getdescriptions(group_pattern, True)
 
-    def group(self, name):
+    def group(self, name: str) -> tuple[str, int, int, int, str]:
         """Process a GROUP command.  Argument:
         - group: the group name
         Returns:
@@ -726,7 +535,7 @@ class NNTP:
                         name = words[4].lower()
         return resp, int(count), int(first), int(last), name
 
-    def help(self, *, file=None):
+    def help(self, *, file: File = None) -> tuple[str, list[str]]:
         """Process a HELP command. Argument:
         - file: Filename string or file object to store the result in
         Returns:
@@ -736,7 +545,7 @@ class NNTP:
         """
         return self._longcmdstring("HELP", file)
 
-    def _statparse(self, resp):
+    def _statparse(self, resp: str) -> tuple[str, int, str]:
         """Internal: parse the response line of a STAT, NEXT, LAST,
         ARTICLE, HEAD or BODY command."""
         if not resp.startswith("22"):
@@ -746,12 +555,12 @@ class NNTP:
         message_id = words[2]
         return resp, art_num, message_id
 
-    def _statcmd(self, line):
+    def _statcmd(self, line: str) -> tuple[str, int, str]:
         """Internal: process a STAT, NEXT or LAST command."""
         resp = self._shortcmd(line)
         return self._statparse(resp)
 
-    def stat(self, message_spec=None):
+    def stat(self, message_spec: Any = None) -> tuple[str, int, str]:
         """Process a STAT command.  Argument:
         - message_spec: article number or message id (if not specified,
           the current article is selected)
@@ -765,21 +574,21 @@ class NNTP:
         else:
             return self._statcmd("STAT")
 
-    def next(self):
+    def next(self) -> tuple[str, int, str]:
         """Process a NEXT command.  No arguments.  Return as for STAT."""
         return self._statcmd("NEXT")
 
-    def last(self):
+    def last(self) -> tuple[str, int, str]:
         """Process a LAST command.  No arguments.  Return as for STAT."""
         return self._statcmd("LAST")
 
-    def _artcmd(self, line, file=None):
+    def _artcmd(self, line: str, file: File = None) -> tuple[str, ArticleInfo]:
         """Internal: process a HEAD, BODY or ARTICLE command."""
         resp, lines = self._longcmd(line, file)
         resp, art_num, message_id = self._statparse(resp)
         return resp, ArticleInfo(art_num, message_id, lines)
 
-    def head(self, message_spec=None, *, file=None):
+    def head(self, message_spec: Any = None, *, file: File = None) -> tuple[str, ArticleInfo]:
         """Process a HEAD command.  Argument:
         - message_spec: article number or message id
         - file: filename string or file object to store the headers in
@@ -793,7 +602,7 @@ class NNTP:
             cmd = "HEAD"
         return self._artcmd(cmd, file)
 
-    def body(self, message_spec=None, *, file=None):
+    def body(self, message_spec: Any = None, *, file: File = None) -> tuple[str, ArticleInfo]:
         """Process a BODY command.  Argument:
         - message_spec: article number or message id
         - file: filename string or file object to store the body in
@@ -807,7 +616,7 @@ class NNTP:
             cmd = "BODY"
         return self._artcmd(cmd, file)
 
-    def article(self, message_spec=None, *, file=None):
+    def article(self, message_spec: Any = None, *, file: File = None) -> tuple[str, ArticleInfo]:
         """Process an ARTICLE command.  Argument:
         - message_spec: article number or message id
         - file: filename string or file object to store the article in
@@ -821,13 +630,13 @@ class NNTP:
             cmd = "ARTICLE"
         return self._artcmd(cmd, file)
 
-    def slave(self):
+    def slave(self) -> str:
         """Process a SLAVE command.  Returns:
         - resp: server response if successful
         """
         return self._shortcmd("SLAVE")
 
-    def xhdr(self, hdr, str, *, file=None):
+    def xhdr(self, hdr: str, str: Any, *, file: File = None) -> tuple[str, list[str]]:
         """Process an XHDR command (optional server extension).  Arguments:
         - hdr: the header type (e.g. 'subject')
         - str: an article nr, a message id, or a range nr1-nr2
@@ -839,13 +648,13 @@ class NNTP:
         pat = re.compile("^([0-9]+) ?(.*)\n?")
         resp, lines = self._longcmdstring("XHDR {0} {1}".format(hdr, str), file)
 
-        def remove_number(line):
+        def remove_number(line: str) -> str:
             m = pat.match(line)
             return m.group(1, 2) if m else line
 
         return resp, [remove_number(line) for line in lines]
 
-    def xover(self, start, end, *, file=None):
+    def xover(self, start: int, end: int, *, file: File = None) -> tuple[str, list[tuple[int, dict[str, str]]]]:
         """Process an XOVER command (optional server extension) Arguments:
         - start: start of range
         - end: end of range
@@ -858,7 +667,9 @@ class NNTP:
         fmt = self._getoverviewfmt()
         return resp, _parse_overview(lines, fmt)
 
-    def over(self, message_spec, *, file=None):
+    def over(
+        self, message_spec: None | str | list[Any] | tuple[Any, ...], *, file: File = None
+    ) -> tuple[str, list[tuple[int, dict[str, str]]]]:
         """Process an OVER command.  If the command isn't supported, fall
         back to XOVER. Arguments:
         - message_spec:
@@ -885,7 +696,7 @@ class NNTP:
         fmt = self._getoverviewfmt()
         return resp, _parse_overview(lines, fmt)
 
-    def date(self):
+    def date(self) -> tuple[str, datetime.datetime]:
         """Process the DATE command.
         Returns:
         - resp: server response if successful
@@ -902,7 +713,7 @@ class NNTP:
             raise NNTPDataError(resp)
         return resp, _parse_datetime(date, None)
 
-    def _post(self, command, f):
+    def _post(self, command: str, f: bytes | bytearray) -> str:
         resp = self._shortcmd(command)
         # Raises a specific exception if posting is not allowed
         if not resp.startswith("3"):
@@ -923,14 +734,14 @@ class NNTP:
         self.file.flush()
         return self._getresp()
 
-    def post(self, data):
+    def post(self, data: bytes | Iterable[bytes]) -> str:
         """Process a POST command.  Arguments:
         - data: bytes object, iterable or file containing the article
         Returns:
         - resp: server response if successful"""
         return self._post("POST", data)
 
-    def ihave(self, message_id, data):
+    def ihave(self, message_id: Any, data: bytes | Iterable[bytes]) -> str:
         """Process an IHAVE command.  Arguments:
         - message_id: message-id of the article
         - data: file containing the article
@@ -939,7 +750,7 @@ class NNTP:
         Note that if the server refuses the article an exception is raised."""
         return self._post("IHAVE {0}".format(message_id), data)
 
-    def _close(self):
+    def _close(self) -> None:
         try:
             if self.file:
                 self.file.close()
@@ -947,7 +758,7 @@ class NNTP:
         finally:
             self.sock.close()
 
-    def quit(self):
+    def quit(self) -> str:
         """Process a QUIT command and close the socket.  Returns:
         - resp: server response if successful"""
         try:
@@ -956,7 +767,7 @@ class NNTP:
             self._close()
         return resp
 
-    def login(self, user=None, password=None, usenetrc=True):
+    def login(self, user: str | None = None, password: str | None = None, usenetrc: bool = True) -> None:
         if self.authenticated:
             raise ValueError("Already logged in.")
         if not user and not usenetrc:
@@ -997,7 +808,7 @@ class NNTP:
             self._caps = None
             self.getcapabilities()
 
-    def _setreadermode(self):
+    def _setreadermode(self) -> None:
         try:
             self.welcome = self._shortcmd("mode reader")
         except NNTPPermanentError:
@@ -1010,7 +821,7 @@ class NNTP:
             else:
                 raise
 
-    def starttls(self, context=None):
+    def starttls(self, context: SSLContext | None = None) -> None:
         """Process a STARTTLS command. Arguments:
         - context: SSL context to use for the encrypted connection
         """
@@ -1037,22 +848,22 @@ class NNTP:
 class NNTP_SSL(NNTP):
     def __init__(
         self,
-        host,
-        port=NNTP_SSL_PORT,
-        user=None,
-        password=None,
-        ssl_context=None,
-        readermode=None,
-        usenetrc=False,
-        timeout=_GLOBAL_DEFAULT_TIMEOUT,
-    ):
+        host: str,
+        port: int = NNTP_SSL_PORT,
+        user: str | None = None,
+        password: str | None = None,
+        ssl_context: SSLContext | None = None,
+        readermode: bool | None = None,
+        usenetrc: bool = False,
+        timeout: float | None = None,
+    ) -> None:
         """This works identically to NNTP.__init__, except for the change
         in default port and the `ssl_context` argument for SSL connections.
         """
         self.ssl_context = ssl_context
         super().__init__(host, port, user, password, readermode, usenetrc, timeout)
 
-    def _create_socket(self, timeout):
+    def _create_socket(self, timeout: float | None) -> SSLSocket:
         sock = super()._create_socket(timeout)
         try:
             sock = _encrypt_on(sock, self.ssl_context, self.host)
@@ -1100,9 +911,7 @@ if __name__ == "__main__":
         type=int,
         help="number of articles to fetch (default: %(default)s)",
     )
-    parser.add_argument(
-        "-S", "--ssl", action="store_true", default=False, help="use NNTP over SSL"
-    )
+    parser.add_argument("-S", "--ssl", action="store_true", default=False, help="use NNTP over SSL")
     args = parser.parse_args()
 
     port = args.port
@@ -1132,10 +941,6 @@ if __name__ == "__main__":
         author = decode_header(over["from"]).split("<", 1)[0]
         subject = decode_header(over["subject"])
         lines = int(over[":lines"])
-        print(
-            "{:7} {:20} {:42} ({})".format(
-                artnum, cut(author, 20), cut(subject, 42), lines
-            )
-        )
+        print("{:7} {:20} {:42} ({})".format(artnum, cut(author, 20), cut(subject, 42), lines))
 
     s.quit()

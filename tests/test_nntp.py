@@ -9,13 +9,13 @@ import ssl
 import textwrap
 import threading
 import unittest
-from unittest.mock import patch
-
-from nntp import nntp
-from nntp.nntp import NNTP, GroupInfo
 from test import support
 from test.support import socket_helper
+from unittest.mock import patch
 
+from nntp import _core as nntp
+from nntp._core import NNTP
+from nntp._types import GroupInfo
 
 certfile = os.path.join(os.path.dirname(__file__), "certdata", "keycert3.pem")
 SSLError = ssl.SSLError
@@ -1683,7 +1683,7 @@ class MockSocketTests(unittest.TestCase):
 
         socket_closed = False
         files = []
-        with patch("nntp.nntp.socket", mock_socket_module), self.assertRaisesRegex(
+        with patch("nntp._core.socket", mock_socket_module), self.assertRaisesRegex(
             expected_error_type, expected_error_msg
         ):
             self.nntp_class("dummy", user=login, password=password)
