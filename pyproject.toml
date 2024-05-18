@@ -9,9 +9,19 @@ packages = [{include = "nntp", from = "src"}]
 keywords = ["nntp", "usenet", "nntplib", "RFC 977", "RFC 3977", "RFC 4642"]
 [tool.poetry.dependencies]
 python = ">=3.9"
+typing-extensions = ">=4.11.0"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.4.4"
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["tests"]
+target-version = "py39"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+fixable = ["ALL"]
 
 [build-system]
 requires = ["poetry-core"]
